@@ -11,6 +11,8 @@ from total_func import is_within_limit, confirm_state, check_trades_and_limit
 from kabusapi_orders import get_orders
 from order_get import latest_detail_of_latest_order
 import json
+from day_price_judge import decide_prices, DecideParams 
+from copy import deepcopy
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -44,11 +46,10 @@ class TradeBot:
         return data.get('StockAccountWallet', 0)
 
     def is_holding(self) -> bool:
-        positions = get_positions(self.position_params)
-        
+        positions = get_positions(self.position_params) or []
         for pos in positions:
-            if pos['Symbol'] == self.target_symbol_no_exchange and int(pos['LeavesQty']) > 0:
-
+            if (pos.get('Symbol') == self.target_symbol_no_exchange and
+                float(pos.get('LeavesQty', 0)) > 0):
                 return True
         return False
     
@@ -106,47 +107,81 @@ class TradeBot:
             json.dump({'last_price': latest_by_seq['Price']}, f, ensure_ascii=False, indent=2)
         return latest_by_seq['Price']
 
+
     def execute_trade(self):
+        # 1) 日次上限などのガード
         if check_trades_and_limit():
             return
+        # 追加ガード：未約定注文があれば新規発注しない
+        if self.has_pending_orders():
+            logger.info("未処理の注文あり。新規発注をスキップ。")
+            return
 
-        # cash = self.get_cash()
+        # 2) 板取得 → その場の売買基準（buy/sell/stop）を算出
+        board = self.get_symbol_price()
+        plan = decide_prices(board, DecideParams())
+        if not plan:
+            logger.info("見送り：当日レンジ/板条件を満たさず。")
+            return
+
+        buy_px  = plan["buy_price"]
+        sell_px = plan["sell_price"]
+        stop_px = plan["stop_price"]
+
+        ask = board.get("AskPrice")
+        bid = board.get("BidPrice")
+
         holding = self.is_holding()
-        symbol_price_info = self.get_symbol_price()
-        # 買いたい時に見る価格
-        want_buy_price = symbol_price_info['AskPrice']
-        if want_buy_price is None:
-            logger.error("現在価格が取得できません。取引を中止します。")
-            return
-        # 売りたい時に見る価格
-        want_sell_price = symbol_price_info['BidPrice']
-        if want_sell_price is None:
-            logger.error("現在価格が取得できません。取引を中止します。")
-            return
-        
+
+        # 3) オートマトン
         if holding:
-            if want_sell_price >= self.SELL_THRESHOLD:
-                send_cash_sell_order(sell_obj)
-                logger.info(f"売り注文発注: {self.TRADE_QTY}@{want_sell_price}")
-            else:
-                logger.info("売却条件を満たしていません。")
+            # --- 保有中：売りのみ ---
+            if bid is None:
+                logger.info("Bid が None。売り判定保留。")
+                return
+
+            # 3-1) 利確
+            if bid >= sell_px:
+                so = deepcopy(sell_obj)
+                # send_cash_sell_order が価格引数を受けない設計なら、オブジェクト側に価格を入れて渡す
+                if isinstance(so, dict):
+                    so["Price"] = sell_px
+                send_cash_sell_order(so, want_sell_price=sell_px)
+                logger.info(f"利確売り発注: {self.TRADE_QTY}@{sell_px} (bid={bid})")
+                return
+
+            # 3-2) 損切り
+            if bid <= stop_px:
+                so = deepcopy(sell_obj)
+                if isinstance(so, dict):
+                    # ここは“確実に出る”ことを優先したいので、成行 or 価格は現在のBidに寄せる方針でもOK
+                    so["Price"] = bid
+                send_cash_sell_order(so)
+                logger.info(f"損切り売り発注: {self.TRADE_QTY}@{bid} (stop={stop_px})")
+                return
+
+            logger.info(f"保有継続: bid={bid}, tp={sell_px}, sl={stop_px}")
+            return
+
         else:
-            print('-----------',want_buy_price <= self.BUY_THRESHOLD, self.latest_orders())
-            if want_buy_price <= self.BUY_THRESHOLD and self.latest_orders():
-                res = send_cash_buy_order(buy_obj, want_buy_price=want_buy_price)
-                order_id = None  # 初期化
-                if res and 'OrderId' in res:
-                    order_id = res['OrderId']
-                logger.info(f"買い注文発注: {self.TRADE_QTY}@{want_buy_price}")
-                time.sleep(5)
+            # --- 未保有：買いのみ ---
+            if ask is None:
+                logger.info("Ask が None。買い判定保留。")
+                return
+
+            # 「買ったら必ず売る」= 連続買い禁止 → latest_orders()/未約定でガード
+            if ask <= buy_px and self.latest_orders():
+                res = send_cash_buy_order(buy_obj, want_buy_price=buy_px)
+                order_id = res.get("OrderId") if isinstance(res, dict) else None
+                logger.info(f"買い注文発注: {self.TRADE_QTY}@{buy_px} (ask={ask})")
+
+                # 直後の反映待ち（必要に応じて短めスリープ）
+                time.sleep(2)
                 if order_id:
-                    latest_price = self.get_order_latest(order_id)
-                else:
-                    latest_price = want_buy_price
+                    self.get_order_latest(order_id)
             else:
-                logger.info("購入条件を満たしていません。")
-    
-    
+                logger.info(f"買い見送り: ask={ask} > buy={buy_px} または latest_orders() NG")
+                return
 
     def run(self):
         try:
@@ -163,11 +198,18 @@ def schedule_loop(bot: TradeBot):
     - 15:31以降 → 終了
     - それ以外 → 300秒毎
     """
+    # その日の株価を取得し、売買基準を決める
+    # board_info = get_board_info()
+    # if board_info is None:
+    #     logger.error("株価情報が取得できませんでした。処理を中止します。")
+    #     return
+    # res = decide_prices(board_info)
+    
     while True:
         now = datetime.now()
         t = now.time()
         # 取引時間帯
-        morning_start = dtime(9, 10)
+        morning_start = dtime(9, 00)
         morning_end = dtime(11, 30)
         afternoon_start = dtime(12, 30)
         afternoon_end = dtime(15, 00)
@@ -182,7 +224,7 @@ def schedule_loop(bot: TradeBot):
 
         # 待機時間決定
         if morning_start <= t <= morning_end or afternoon_start <= t <= afternoon_end:
-            interval = 5
+            interval = 2
         elif t < morning_start:
             interval = 60
         else:

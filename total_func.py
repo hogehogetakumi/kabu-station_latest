@@ -38,20 +38,25 @@ def is_within_limit(limit: float = 1_000_000.0) -> bool:
 
 def confirm_state() -> bool:
     """
-    state:1, 2 の注文の約定金額を計算して返す
+    未完了の注文（終了=5以外）で、残数量>0のものが1件でもあれば True を返す。
+    未完了が無ければ False。
     """
-    total = 0.0
     orders = get_orders(order_params)
     if not orders:
-        print("No orders found.")   
-        pass
-    
-    for order in orders:
-        for d in order.get("Details", []):
-            if d.get("State") == 1 or d.get("State") == 2:
-                print(f"Order ID: {d.get('ID')}, State: {d.get('State')}, Price: {d.get('Price')}, Qty: {d.get('Qty')}")
-                return True
+        return False
+
+    for o in orders:
+        state = int(o.get("OrderState", o.get("State", 5)))  # OrderState優先
+        order_qty = float(o.get("OrderQty") or 0)
+        cum_qty   = float(o.get("CumQty") or 0)
+        leaves    = float(o.get("LeavesQty") or (order_qty - cum_qty))
+
+        # 1,2,3,4 = 未完了 / 5 = 終了（全約定・取消・失効・期限切れ・エラー）
+        if state in (1, 2, 3, 4) and leaves > 0:
+            return True
+
     return False
+
 
 
 
@@ -99,4 +104,4 @@ def check_trades_and_limit(
         return True
 
 if __name__ == "__main__":
-    print(check_trades_and_limit())
+    print(confirm_state())

@@ -1,45 +1,37 @@
-import json
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-from const import target_symbol, position_params, sell_obj, buy_obj, order_params_by_id, target_symbol_no_exchange
 
 def latest_order(orders) -> Optional[Dict[str, Any]]:
-    """
-    RecvTime が最も新しい注文を返す
-    """
     if isinstance(orders, str):
         orders = json.loads(orders)
-
     if not orders:
         return None
-
     return max(orders, key=lambda o: datetime.fromisoformat(o["RecvTime"]))
 
-def latest_detail_of_latest_order(order) -> Optional[Dict[str, Any]]:
+def latest_detail_of_latest_order(orders) -> bool:
     """
-    1. 最新注文を取得
-    2. その Details から TransactTime が最大の要素（末端レコード）を返す
+    直近の最新注文が「売り(Side=2)で未完了（終了=5以外 & 残数量>0）」なら False、
+    それ以外は True を返す。
     """
-    order = latest_order(order)
-    if not order:
-        return None
+    o = latest_order(orders)
+    if not o:
+        return True  # 注文が無い→新規発注OKという方針
 
-    details = order.get("Details", [])
-    if not details:
-        return None
+    # Side はトップレベルから
+    side = o.get("Side")
+    if isinstance(side, str):
+        try:
+            side = int(side)
+        except ValueError:
+            side = None
 
-    latest = max(details, key=lambda d: datetime.fromisoformat(d["TransactTime"]))
-    side = latest.get("Side")
-    state = latest.get("State")
-    # Sideが2かつStateが5ならTrue、Sideが2以外ならTrue
-    print(f"-----------0---Latest Order - Side: {side}, State: {state}")
-    if side == 2 and state == 5:
-        return True
-    elif side == 2:
+    # 注文全体の状態と残数量で“生死”を判断
+    state = int(o.get("OrderState", o.get("State", 5)))
+    order_qty = float(o.get("OrderQty") or 0)
+    cum_qty   = float(o.get("CumQty") or 0)
+    leaves    = float(o.get("LeavesQty") or (order_qty - cum_qty))
+
+    # 「最新が売りで未完了なら False」= 新規買いを抑止
+    if side == 2 and state in (1, 2, 3, 4) and leaves > 0:
         return False
-    else:
-        return True
-    
-# --- 使用例 --------------------------------------------------------------
-# latest_detail = latest_detail_of_latest_order(orders_response)
-# print(json.dumps(latest_detail, indent=2, ensure_ascii=False))
+    return True

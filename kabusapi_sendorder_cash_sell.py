@@ -4,7 +4,9 @@ import pprint
 from kabusapi_token import get_token
 from const import api_key, base_url, sell_obj
 
-def send_cash_sell_order(sell_obj):
+def send_cash_sell_order(sell_obj, want_sell_price=None):
+    if want_sell_price is not None:
+        sell_obj["Price"] = want_sell_price
     json_data = json.dumps(sell_obj).encode('utf-8')
     print('--------', json_data)
     url = f'{base_url}sendorder'

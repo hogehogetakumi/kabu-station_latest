@@ -2,9 +2,9 @@ import urllib.request
 import json
 import pprint
 from kabusapi_token import get_token
-from const import api_key, base_url
+from const import api_key, base_url, target_symbol_no_exchange
 
-def get_board_info(symbol='8918@1'):
+def get_board_info(symbol='9432@1'):
     url = f'{base_url}/board/{symbol}'
     req = urllib.request.Request(url, method='GET')
     req.add_header('Content-Type', 'application/json')

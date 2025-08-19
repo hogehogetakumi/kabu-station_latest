@@ -1,8 +1,8 @@
 import os
 from datetime import datetime
 
-target_symbol = '8918@1'
-target_symbol_no_exchange = '8918'
+target_symbol = '9973@1'
+target_symbol_no_exchange = '9973'
 
 # # 検証環境
 # api_key = os.environ["VERIFI_API_PASSWORD"]
@@ -20,7 +20,7 @@ def get_today_midnight():
     return midnight.strftime('%Y%m%d%H%M%S')
 
 buy_obj = {
-    "Symbol":       "8918",   # 銘柄コード
+    "Symbol":       target_symbol_no_exchange,   # 銘柄コード
     "Exchange":     1,        # 市場コード（東証＝1）
     "SecurityType": 1,        # 現物＝1
     "Side":         2,      # 買い＝2
@@ -36,7 +36,7 @@ buy_obj = {
 
 
 sell_obj = {
-    "Symbol":         "8918",   # 銘柄コード
+    "Symbol":         target_symbol_no_exchange,   # 銘柄コード
     "Exchange":       1,        # 東証
     "SecurityType":   1,        # 現物
     "Side":           1,        # 売り（1）
@@ -53,7 +53,7 @@ sell_obj = {
 today_start = get_today_midnight()
 order_params = {
     "product": "1",  # Enum値（1: 現物取引）
-    "symbol": "8918",  # 銘柄コード
+    "symbol": target_symbol_no_exchange,  # 銘柄コード
     "side": "2",  # Enum値（1: 売、2:
     "updtime": today_start,  # 本日の午前0時のタイムスタンプ
 }
@@ -70,7 +70,7 @@ sample_order_history = [
     "OrderState": 5,
     "OrdType": 1,
     "RecvTime": "2025-08-03T09:01:10.000000+09:00",
-    "Symbol": "8918",
+    "Symbol": target_symbol_no_exchange,
     "SymbolName": "ランド",
     "Exchange": 1,
     "ExchangeName": "東証プ",
@@ -110,7 +110,7 @@ sample_order_history = [
     "OrderState": 5,
     "OrdType": 1,
     "RecvTime": "2025-08-03T09:10:05.000000+09:00",
-    "Symbol": "8918",
+    "Symbol": target_symbol_no_exchange,
     "SymbolName": "ランド",
     "Exchange": 1,
     "ExchangeName": "東証プ",
@@ -150,7 +150,7 @@ sample_order_history = [
     "OrderState": 5,
     "OrdType": 1,
     "RecvTime": "2025-08-03T09:30:20.000000+09:00",
-    "Symbol": "8918",
+    "Symbol": target_symbol_no_exchange,
     "SymbolName": "ランド",
     "Exchange": 1,
     "ExchangeName": "東証プ",
@@ -190,7 +190,7 @@ sample_order_history = [
     "OrderState": 5,
     "OrdType": 1,
     "RecvTime": "2025-08-03T09:45:40.000000+09:00",
-    "Symbol": "8918",
+    "Symbol": target_symbol_no_exchange,
     "SymbolName": "ランド",
     "Exchange": 1,
     "ExchangeName": "東証プ",
@@ -229,7 +229,7 @@ sample_order_history = [
 
 position_params = {
     'product': 1,  # Enum値（0: 全て、1: 現物、2: 信用、3: 先物、4: OP）
-    'symbol': '8918',  # 銘柄コード
+    'symbol': target_symbol_no_exchange,  # 銘柄コード
     'side': '1',  # Enum値（1: 売、2: 買）
     'addinfo': 'false'  # true: 追加情報を出力する、false: 出力しない
 }
