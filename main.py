@@ -7,12 +7,13 @@ from kabusapi_sendorder_cash_sell import send_cash_sell_order
 from kabusapi_sendorder_cash_buy import send_cash_buy_order
 from kabusapi_cash import get_cash_balance
 from const import target_symbol, position_params, sell_obj, buy_obj, order_params_by_id, target_symbol_no_exchange
-from total_func import is_within_limit, confirm_state, check_trades_and_limit
+from total_func import is_within_limit, confirm_state, get_total, check_trades_and_limit
 from kabusapi_orders import get_orders
 from order_get import latest_detail_of_latest_order
 import json
-from day_price_judge import decide_prices, DecideParams 
+from day_price_judge import decide_prices_scalp, ScalpParams, search_buy_candidates
 from copy import deepcopy
+from kabusapi_cancelorder import cancel_order
 
 # ログ設定
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -46,9 +47,19 @@ class TradeBot:
         return data.get('StockAccountWallet', 0)
 
     def is_holding(self) -> bool:
+    # Load symbol from buy_price.json; fallback to self.target_symbol_no_exchange on error
+        try:
+            with open('buy_price.json', 'r', encoding='utf-8') as bf:
+                bdata = json.load(bf)
+                file_symbol = bdata.get('symbol')
+        except Exception as e:
+            file_symbol = self.target_symbol_no_exchange
+        
+        self.position_params['symbol'] = file_symbol
         positions = get_positions(self.position_params) or []
+        
         for pos in positions:
-            if (pos.get('Symbol') == self.target_symbol_no_exchange and
+            if (pos.get('Symbol') == file_symbol and
                 float(pos.get('LeavesQty', 0)) > 0):
                 return True
         return False
@@ -116,51 +127,58 @@ class TradeBot:
         if self.has_pending_orders():
             logger.info("未処理の注文あり。新規発注をスキップ。")
             return
-
-        # 2) 板取得 → その場の売買基準（buy/sell/stop）を算出
-        board = self.get_symbol_price()
-        plan = decide_prices(board, DecideParams())
-        if not plan:
-            logger.info("見送り：当日レンジ/板条件を満たさず。")
-            return
-
-        buy_px  = plan["buy_price"]
-        sell_px = plan["sell_price"]
-        stop_px = plan["stop_price"]
-
-        ask = board.get("AskPrice")
-        bid = board.get("BidPrice")
-
+        
+        # 株を保有してるか確認
         holding = self.is_holding()
+
+        if not holding:
+            # 2) 板取得 → その場の売買基準（buy/sell/stop）を算出
+            plan = search_buy_candidates()
+            if not plan:
+                logger.info("見送り：当日レンジ/板条件を満たさず。")
+                return
+
+            buy_px  = plan["buy_price"]
+            sell_px = plan["sell_price"]
+            stop_px = plan["stop_price"]
+            target_symbol = plan["target_symbol"]
+
+            ask = plan["AskPrice"]
+            bid = plan["BidPrice"]
 
         # 3) オートマトン
         if holding:
-            # --- 保有中：売りのみ ---
-            if bid is None:
-                logger.info("Bid が None。売り判定保留。")
-                return
+            # --- 保有中：損切り優先、そうでなければ問答無用で利確売り ---
+            # buy_price.json があれば優先して買値+1 を利確価格として使う
+            override_sell_px = 9999999
+            try:
+                with open('buy_price.json', 'r', encoding='utf-8') as bf:
+                    bdata = json.load(bf)
+                    bp = bdata.get('buy_price')
+                    target_symbol = bdata.get('symbol')
+                    if bp is not None:
+                        override_sell_px = float(bp) + 1
+                        logger.info(f"buy_price.json から買値を取得: {bp} → 利確を {override_sell_px} に上書き")
+            except FileNotFoundError:
+                logger.info('buy_price.json が見つからないため、planの利確価格を使用します。')
+            except Exception as e:
+                logger.warning(f"buy_price.json 読み込みエラー: {e} — planの利確価格を使用します。")
 
-            # 3-1) 利確
-            if bid >= sell_px:
-                so = deepcopy(sell_obj)
-                # send_cash_sell_order が価格引数を受けない設計なら、オブジェクト側に価格を入れて渡す
-                if isinstance(so, dict):
-                    so["Price"] = sell_px
-                send_cash_sell_order(so, want_sell_price=sell_px)
-                logger.info(f"利確売り発注: {self.TRADE_QTY}@{sell_px} (bid={bid})")
-                return
+            # 1) 損切り優先: Bid が取れる状態で現在価格が stop 以下なら即成行/寄せで売る
+            # if bid is not None and bid <= stop_px:
+            #     so = deepcopy(sell_obj)
+            #     if isinstance(so, dict):
+            #         # Bid に寄せる／成行で確実に出す設定
+            #         so["Price"] = bid
+            #     send_cash_sell_order(so)
+            #     logger.info(f"損切り売り発注: {self.TRADE_QTY}@{bid} (stop={stop_px})")
+            #     return
 
-            # 3-2) 損切り
-            if bid <= stop_px:
-                so = deepcopy(sell_obj)
-                if isinstance(so, dict):
-                    # ここは“確実に出る”ことを優先したいので、成行 or 価格は現在のBidに寄せる方針でもOK
-                    so["Price"] = bid
-                send_cash_sell_order(so)
-                logger.info(f"損切り売り発注: {self.TRADE_QTY}@{bid} (stop={stop_px})")
-                return
-
-            logger.info(f"保有継続: bid={bid}, tp={sell_px}, sl={stop_px}")
+            # 2) 損切り条件に該当しない → 問答無用で利確売りを出す
+            so = deepcopy(sell_obj)
+            if isinstance(so, dict):
+                so["Price"] = override_sell_px
+            send_cash_sell_order(so, target_symbol, want_sell_price=override_sell_px)
             return
 
         else:
@@ -170,18 +188,62 @@ class TradeBot:
                 return
 
             # 「買ったら必ず売る」= 連続買い禁止 → latest_orders()/未約定でガード
-            if ask <= buy_px and self.latest_orders():
-                res = send_cash_buy_order(buy_obj, want_buy_price=buy_px)
+            if self.latest_orders() and get_total(buy_px*100):
+                res = send_cash_buy_order(buy_obj, target_symbol, want_buy_price=buy_px)
                 order_id = res.get("OrderId") if isinstance(res, dict) else None
                 logger.info(f"買い注文発注: {self.TRADE_QTY}@{buy_px} (ask={ask})")
+                try:
+                    with open('buy_price.json', 'w', encoding='utf-8') as bf:
+                        json.dump({'symbol': target_symbol, 'buy_price': buy_px}, bf, ensure_ascii=False, indent=2)
+                        logger.info(f"buy_price.json に買値を保存: {buy_px}")
+                except Exception as e:
+                    logger.warning(f"buy_price.json の保存に失敗しました: {e}")
 
-                # 直後の反映待ち（必要に応じて短めスリープ）
-                time.sleep(2)
+                time.sleep(1)  # 直後の反映待ち
                 if order_id:
-                    self.get_order_latest(order_id)
+                    # --- 約定監視（最大15秒、1秒おき） ---
+                    WAIT_SEC = 15.0
+                    INTERVAL = 1.0
+                    t0 = time.time()
+                    filled = False
+
+                    while True:
+                        od = self.get_order_latest(order_id) or {}
+
+                        # 約定数量の取得（環境差吸収: ExecutedQty/CumQty/ExecutionQty を順に参照）
+                        exec_qty = od.get("ExecutedQty") or od.get("CumQty") or od.get("ExecutionQty") or 0
+                        try:
+                            exec_qty = float(exec_qty)
+                        except Exception:
+                            exec_qty = 0.0
+
+                        if exec_qty >= float(self.TRADE_QTY):
+                            filled = True
+                            logger.info(f"買い注文 約定完了: {exec_qty}/{self.TRADE_QTY} order_id={order_id}")
+                            # 買値の保存（約定確認後）
+                            try:
+                                with open('buy_price.json', 'w', encoding='utf-8') as bf:
+                                    json.dump({'symbol': target_symbol, 'buy_price': buy_px}, bf, ensure_ascii=False, indent=2)
+                                logger.info(f"buy_price.json に買値を保存: {buy_px}")
+                            except Exception as e:
+                                logger.warning(f"buy_price.json の保存に失敗しました: {e}")
+                            break
+
+                        # タイムアウト判定
+                        if (time.time() - t0) >= WAIT_SEC:
+                            logger.info(f"買い注文 未約定のため取消: 約定={exec_qty}/{self.TRADE_QTY}, order_id={order_id}")
+                            try:
+                                cancel_order(order_id)  # kabusapi_cancelorder.py の関数
+                            except Exception as e:
+                                logger.error(f"取消失敗: {e}")
+                            # 未約定（または一部約定）で終了
+                            return
+
+                        time.sleep(INTERVAL)
             else:
                 logger.info(f"買い見送り: ask={ask} > buy={buy_px} または latest_orders() NG")
                 return
+
 
     def run(self):
         try:
@@ -224,7 +286,7 @@ def schedule_loop(bot: TradeBot):
 
         # 待機時間決定
         if morning_start <= t <= morning_end or afternoon_start <= t <= afternoon_end:
-            interval = 2
+            interval = 1
         elif t < morning_start:
             interval = 60
         else:

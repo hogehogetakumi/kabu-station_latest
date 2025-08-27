@@ -9,7 +9,7 @@ def get_positions(params=None):
     url = f'{base_url}positions'
     if params is None:
         params = { 'product': 0 }  # デフォルトで全てのポジションを取得
-    req = urllib.request.Request('{}?{}'.format(url, urllib.parse.urlencode(order_params)), method='GET')
+    req = urllib.request.Request('{}?{}'.format(url, urllib.parse.urlencode(params)), method='GET')
     req.add_header('Content-Type', 'application/json')
     token = get_token()
     req.add_header('X-API-KEY', token)
@@ -36,7 +36,7 @@ def get_positions(params=None):
 if __name__ == "__main__":
     params = {
         'product': "1",
-        'symbol': '8918',
+        'symbol': '260A',
         'side': '2',
         'addinfo': 'true'
     }

@@ -1,167 +1,316 @@
-from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
-from kabusapi_board  import get_board_info
+from typing import Optional, Tuple, Dict, Any, List
+import math
+from datetime import datetime, time as dtime, timedelta
+from const import symbol_list
+from kabusapi_board import get_board_info
+import time
+
 
 @dataclass
-class DecideParams:
-    tick: float = 1.0                     # JDIは0.1円刻み
-    tp_min_ticks: int = 1                 # 最低利確: +1tick
-    tp_max_ticks: int = 3                 # 伸びても +3tick まで
-    sl_ticks: int = 1                     # 損切り: -1tick
-    wall_abs_qty: int = 300_000           # 「板の壁」とみなす絶対数量
-    wall_rel_pct: float = 0.10            # 当日出来高の◯%超も「壁」
-    near_low_allow_ticks: int = 3         # 当日安値+0.3円以内のみ買い許容
-    min_room_to_resist_ticks: int = 2     # 壁まで最低 +0.2円 の余地が必要
+class ScalpParams:
+    # --- 価格系（呼値） ---
+    tick: float = 1.0
+    detect_tick_from_board: bool = True
 
-def _tick_floor(p: float, tick: float) -> float:
-    return round((int(round(p / tick, 0)) * tick), 1)
+    # --- テイクプロフィット/ストップ ---
+    tp_min_ticks: int = 1
+    tp_max_ticks: int = 1
+    sl_ticks: int = 1
+    take_profit_yen: float = 1.0  # “1円抜き”優先
 
-def _tick_round(p: float, tick: float) -> float:
-    # 0.1刻み丸め
-    return float(f"{p:.1f}")
+    # --- 板・不均衡トリガ ---
+    imbalance_take: float = 1.1          # 1.3 → 1.1（軽め優勢でテイク許可）
+    small_ask_take: int = 0
+    improve_when_spread_ge: int = 1
+    thin_next_asks_ratio: float = 0.7
 
-def _prev_tick(p: float, tick: float) -> float:
-    return _tick_round(p - tick, tick)
+    # --- 出来高急増（1秒）トリガ ---
+    vol_surge_mult: float = 1.2          # 1.5 → 1.2（急増条件を緩める）
+    min_1s_value: int = 50_000           # 150k → 50k 円/秒（低位×超流動向け）
+    require_surge_for_take: bool = False # 急増がなくてもテイク可
 
-def _find_wall_side(board: Dict[str, Any], side: str, params: DecideParams, total_vol: float) -> Optional[Tuple[float, float]]:
+    # --- セーフティ/フィルタ ---
+    max_spread_ticks: int = 2
+    max_spread_pct: float = 0.25
+    min_top_depth: int = 0
+    allow_join_when_no_surge: bool = True
+
+    # --- 価値（円）ベースの流動性チェック ---
+    use_value_based_filters: bool = True
+    min_top_value_yen: int = 150_000      # 200k → 150k（板トップの金額しきい緩和）
+    small_ask_value_yen: int = 600_000    # 300k → 600k（小口Askなら“取りに行く”許可）
+
+    # --- join/improve と take で分ける代金しきい ---
+    min_1s_value_take: Optional[int] = None
+    min_1s_value_join: Optional[int] = 30_000  # 100k → 30k
+
+    # --- VWAP 乖離フィルタ（低位は無効化） ---
+    vwap_disable_below_price: float = 100.0    # 50 → 100（JDI帯は実質無効）
+    vwap_max_abs_yen: float = 2.0              # 1.0 → 2.0
+    vwap_max_pct: float = 0.004                # 0.2% → 0.4%
+
+    # --- キュー先行量（埋まり見込み時間） ---
+    max_queue_eta_sec: float = 10.0            # 3 → 10（並び許容を拡大）
+    # ※ 退出側ETAは関数内の固定30sのままでもOK（必要なら 20–30s で調整）
+
+# 買いの条件を満たす銘柄を見つける
+def search_buy_candidates() -> List[Dict[str, Any]]:
     """
-    side='Sell' or 'Buy'
-    壁（数量が多い価格）を 1～10 本の板から先頭側で検出して返す (price, qty)。
-    絶対数量 or 出来高に対する相対割合のどちらかを満たせば壁と判定。
+    boards に含まれる各銘柄の板を評価し、
+    Spread≥1tick / Exit≤15s / 売り薄(≤2) を満たす中から
+    「退出ETAが最短」の銘柄の plan(dict) を1件だけ返す。
+    ヒットなしなら None。関数名・引数・戻り値の形式は元のまま。
+    ※ decide_prices_scalp の戻り値フォーマットは変更しない。
     """
-    threshold = max(params.wall_abs_qty, total_vol * params.wall_rel_pct / 100.0)
-    # threshold は「◯株」を想定（TradingVolume が株数ならOK）
-    for i in range(1, 11):
-        key = f"{side}{i}"
-        level = board.get(key)
-        if not level:
+    ETA_LIMIT   = 15.0
+    RATIO_LIMIT = 2.0
+    p = ScalpParams()
+
+    # boards が空なら従来フロー（symbol_list → get_board_info）で補完
+    source_boards: List[Dict[str, Any]] = []
+    if not source_boards:
+        for symbol in symbol_list:
+            time.sleep(0.3)
+            bd = get_board_info(f"{symbol}@1")
+            if bd:
+                source_boards.append(bd)
+
+    best_plan: Optional[Dict[str, Any]] = None
+    best_eta: float = float("inf")
+    best_ratio: float = float("inf")
+    best_symbol: Optional[str] = None
+
+    for bd in source_boards:
+        s1 = bd.get("Sell1") or {}
+        b1 = bd.get("Buy1")  or {}
+        ask = float(s1.get("Price") or bd.get("AskPrice") or 0.0)
+        bid = float(b1.get("Price") or bd.get("BidPrice")  or 0.0)
+        if ask <= 0 or bid <= 0:
             continue
-        price, qty = level.get("Price"), level.get("Qty")
-        if price is None or qty is None:
+        # スナップ逆転補正
+        if ask < bid:
+            ask, bid = bid, ask
+
+        # 1) Spread ≥ 1tick
+        tick = _infer_tick(bd, 1.0 if p.tick <= 0 else p.tick)
+        if ask - bid < tick:
             continue
-        if qty >= threshold:
-            return float(price), float(qty)
-    return None
 
-def decide_prices(board: Dict[str, Any], params: DecideParams = DecideParams()) -> Optional[Dict[str, Any]]:
+        # 2) 売りが薄い/買いが厚い … Sell1.Qty / Buy1.Qty ≤ 2
+        s1q = float(s1.get("Qty") or bd.get("AskQty") or 0.0)
+        b1q = float(b1.get("Qty") or bd.get("BidQty") or 0.0)
+        if b1q <= 0:
+            continue
+        ratio = s1q / b1q
+        if ratio > RATIO_LIMIT:
+            continue
+
+        # 3) Exit ≤ 15秒 … (Sell1.Price * Sell1.Qty) / OneSecValue ≤ 15
+        osv = float(bd.get("OneSecValue") or 0.0)
+        if osv <= 0.0:
+            tv = float(bd.get("TradingValue") or 0.0)
+            tstr = bd.get("TradingVolumeTime") or bd.get("CurrentPriceTime")
+            osv = (tv / max(_session_elapsed_seconds(tstr), 1)) * 0.35
+        if osv <= 0:
+            continue
+        eta_exit = (ask * s1q) / osv
+        if eta_exit > ETA_LIMIT:
+            continue
+
+        # 上記フィルタ通過 → 実際の発注計画を既存関数で生成
+        plan = decide_prices_scalp(bd, p)
+        if not plan:
+            continue
+
+        # ランキング: ETA最短 → 比率が小さい → フロー大
+        better = (
+            (eta_exit < best_eta) or
+            (eta_exit == best_eta and ratio < best_ratio) or
+            (eta_exit == best_eta and ratio == best_ratio and osv > (best_plan.get("notes", {}).get("one_sec_value", -1) if best_plan else -1))
+        )
+        if better:
+            best_plan = plan
+            best_eta = eta_exit
+            best_ratio = ratio
+            best_symbol = bd.get("Symbol")
+
+    # 可能なら target_symbol をモジュール変数として更新（戻り値の形式は不変）
+    if best_symbol is not None:
+        try:
+            globals()["target_symbol"] = best_symbol  # 副作用で最終候補を保持
+        except Exception:
+            pass
+
+    return best_plan if best_plan is not None else None
+
+
+
+def _levels(board: Dict[str, Any], side: str, n: int = 3) -> List[Tuple[float, float]]:
+    out = []
+    for i in range(1, n+1):
+        lv = board.get(f"{side}{i}", {})
+        p, q = lv.get("Price"), lv.get("Qty")
+        if p is not None and q is not None:
+            out.append((float(p), float(q)))
+    return out
+
+def _round_to_tick(p: float, tick: float) -> float:
+    if tick <= 0:
+        tick = 1.0
+    return float(f"{round(p / tick) * tick:.3f}")
+
+def _ticks_for_yen(yen: float, tick: float) -> int:
+    if tick <= 0:
+        return 1
+    return max(1, int(round(yen / tick)))
+
+def _infer_tick(board: Dict[str, Any], fallback_tick: float) -> float:
+    for k in ("Tick", "TickSize", "MinTick", "PriceTick"):
+        t = board.get(k)
+        if t is not None:
+            try:
+                t = float(t)
+                if t > 0:
+                    return t
+            except Exception:
+                pass
+    prices: List[float] = []
+    for side in ("Sell", "Buy"):
+        for i in range(1, 4):
+            lv = board.get(f"{side}{i}", {})
+            p = lv.get("Price")
+            if p is not None:
+                try:
+                    prices.append(float(p))
+                except Exception:
+                    pass
+    if any(abs(round(px * 10) - px * 10) < 1e-6 and abs(round(px) - px) > 1e-6 for px in prices):
+        return 0.1
+    return fallback_tick if fallback_tick > 0 else 1.0
+
+def _session_elapsed_seconds(time_str: Optional[str]) -> int:
     """
-    当日の板・レンジから
-      - buy_price（買い指値）
-      - sell_price（売り指値/利確）
-      - stop_price（損切り）
-      - 参考情報（検出した壁・当日レンジなど）
-    を決める。条件が悪い場合は None を返す。
+    '2025-08-20T13:01:33+09:00' のようなISO文字列から、当日9:00:00(JST)からの経過秒を概算。
+    文字列が無い/壊れている場合は 1 を返す（ゼロ割回避）。
+    ※ 昼休みは無視（安全側の過大評価＝ETAが厳しめになる）
     """
-    # 必要フィールド取得
-    bid = board.get("BidPrice")
-    ask = board.get("AskPrice")
-    last = board.get("CurrentPrice")
-    day_high = board.get("HighPrice")
-    day_low  = board.get("LowPrice")
-    total_vol = float(board.get("TradingVolume") or 0)
+    try:
+        ts = datetime.fromisoformat(time_str)
+        start = ts.replace(hour=9, minute=0, second=0, microsecond=0)
+        if ts < start:
+            return 1
+        return max(1, int((ts - start).total_seconds()))
+    except Exception:
+        return 1
 
-    if None in (ask, bid, last, day_high, day_low):
+def decide_prices_scalp(board: Dict[str, Any], p: ScalpParams = ScalpParams()) -> Optional[Dict[str, Any]]:
+    """
+    【超簡略版】
+    条件は以下の3つのみで判定し、満たしたら Buy1 に並び +1tick で利確、-p.sl_ticks*tick で損切り。
+      1) Spread ≥ 1tick  … Sell1.Price - Buy1.Price ≥ tick
+      2) Exit ≤ 15秒      … (Sell1.Price * Sell1.Qty) / OneSecValue ≤ 15
+      3) 売りが薄い/買いが厚い … Sell1.Qty / Buy1.Qty ≤ 2
+    * OneSecValue が無い場合は (TradingValue / 当日経過秒) * 0.35 で近似。
+    * 関数名・引数・戻り値の形式は既存と同じ。
+    """
+    # --- Best Bid/Ask（Sell1/Buy1優先、Ask/Bidはフォールバック） ---
+    sell1 = board.get("Sell1") or {}
+    buy1  = board.get("Buy1")  or {}
+
+    ask = sell1.get("Price", None) if sell1 else None
+    bid = buy1.get("Price", None)  if buy1  else None
+    if ask is None:
+        ask = board.get("AskPrice")
+    if bid is None:
+        bid = board.get("BidPrice")
+    if ask is None or bid is None:
+        print("day_price_judge: Bid/Ask not found in board data.")
         return None
 
-    ask = float(ask); bid = float(bid); last = float(last)
-    day_high = float(day_high); day_low = float(day_low)
+    ask = float(ask); bid = float(bid)
 
-    # 壁検出
-    sell_wall = _find_wall_side(board, "Sell", params, total_vol)  # 先頭側の抵抗
-    buy_wall  = _find_wall_side(board, "Buy",  params, total_vol)  # 先頭側の支持
+    # スナップ逆転対策（理論上起きないが、入れ替えで整合）
+    if ask < bid:
+        ask, bid = bid, ask
 
-    # 買い候補：現状のAskと支持（買い壁）の高い方に寄せる（無理追いはしない）
-    tentative_buy = ask
-    if buy_wall:
-        tentative_buy = max(tentative_buy, buy_wall[0])
+    # --- Qty も Sell1/Buy1 を優先（notes用/比率用） ---
+    ask_qty = float((sell1.get("Qty") if sell1 else board.get("AskQty")) or 0.0)
+    bid_qty = float((buy1.get("Qty")  if buy1  else board.get("BidQty"))  or 0.0)
 
-    # 当日安値から離れすぎているなら見送り（リスク高）
-    if (tentative_buy - day_low) > params.near_low_allow_ticks * params.tick:
+    # --- tick 決定 ---
+    tick = _infer_tick(board, p.tick) if p.detect_tick_from_board else max(1e-9, p.tick)
+    if tick <= 0:
+        tick = 1.0
+
+    spread = ask - bid
+    spread_ticks = int(round(spread / tick)) if tick > 0 else 0
+    spread_pct = spread / max(1.0, bid)
+
+    # 1) Spread ≥ 1tick
+    if spread < tick:
+        print(f"day_price_judge: Spread < 1tick (spread={spread:.4f}, tick={tick}).")
         return None
 
-    buy_price = _tick_round(tentative_buy, params.tick)
-
-    # 利確候補：最低 +1tick、最大 +3tick。手前に強い売り壁があれば壁の1tick手前に置く
-    tp_min = buy_price + params.tp_min_ticks * params.tick
-    tp_max = buy_price + params.tp_max_ticks * params.tick
-    target = tp_min
-    if sell_wall:
-        wall_price = sell_wall[0]
-        # 壁が近すぎるなら利幅が確保できないため見送り
-        if (wall_price - buy_price) < params.min_room_to_resist_ticks * params.tick:
-            return None
-        target = min(wall_price - params.tick, tp_max)
-
-    sell_price = _tick_round(max(target, tp_min), params.tick)
-
-    # ストップ：買値-1tick
-    stop_price = _tick_round(buy_price - params.sl_ticks * params.tick, params.tick)
-
-    # 境界チェック
-    if not (day_low <= buy_price <= day_high):
+    # 2) 売りが薄い/買いが厚い … Sell1.Qty / Buy1.Qty ≤ 2
+    RATIO_LIMIT = 2.0
+    if bid_qty <= 0:
+        print("day_price_judge: BidQty is zero; cannot evaluate ratio.")
         return None
-    if sell_price <= buy_price:
-        return None
-    if stop_price >= buy_price:
+    ratio = (ask_qty / bid_qty) if bid_qty > 0 else float("inf")
+    if ratio > RATIO_LIMIT:
+        print(f"day_price_judge: Depth ratio too heavy (Sell1/Buy1={ratio:.2f} > {RATIO_LIMIT}).")
         return None
 
-    # 参考情報
-    info = {
+    # 3) Exit ≤ 15秒 … (Sell1.Price * Sell1.Qty) / OneSecValue ≤ 15
+    one_sec_value = float(board.get("OneSecValue") or 0.0)
+    if one_sec_value <= 0.0:
+        tv = float(board.get("TradingValue") or 0.0)  # 当日売買代金(円)
+        tstr = board.get("TradingVolumeTime") or board.get("CurrentPriceTime")
+        elapsed = _session_elapsed_seconds(tstr)
+        one_sec_value = (tv / max(elapsed, 1)) * 0.35  # 保守近似
+
+    ETA_LIMIT = 15.0
+    eta_exit = (ask * ask_qty) / max(one_sec_value, 1.0) if ask > 0 else float("inf")
+    if eta_exit > ETA_LIMIT:
+        print(f"day_price_judge: Exit ETA too long ({eta_exit:.2f}s > {ETA_LIMIT}s).")
+        return None
+
+    # --- 条件クリア → Buy1でjoin、+1tick利確、-p.sl_ticks損切り ---
+    buy_price  = _round_to_tick(float(bid), tick)
+    tp_ticks   = 1
+    sell_price = _round_to_tick(buy_price + tp_ticks * tick, tick)
+    stop_price = _round_to_tick(buy_price - max(1, p.sl_ticks) * tick, tick)
+
+    if not (sell_price > buy_price and stop_price < buy_price):
+        print("day_price_judge: Invalid price order (sell/stop must be >/< buy).")
+        return None
+
+    # 参考: 成行/成買/成売の情報（不均衡メモ）
+    mkt_buy  = float(board.get("MarketOrderBuyQty")  or 0.0)
+    mkt_sell = float(board.get("MarketOrderSellQty") or 0.0)
+    imbalance = (bid_qty + mkt_buy) / max(1.0, (ask_qty + mkt_sell))
+
+    return {
+        "target_symbol": board.get("Symbol", ""),
         "buy_price": buy_price,
         "sell_price": sell_price,
         "stop_price": stop_price,
-        "ask": ask,
-        "bid": bid,
-        "last": last,
-        "day_low": day_low,
-        "day_high": day_high,
-        "sell_wall": {"price": sell_wall[0], "qty": sell_wall[1]} if sell_wall else None,
-        "buy_wall": {"price": buy_wall[0], "qty": buy_wall[1]} if buy_wall else None,
-        "reason": []
+        "AskPrice": ask,
+        "BidPrice": bid,
+        "entry_style": "join",   # 常に Buy1 に並ぶ
+        "notes": {
+            "tick": tick,
+            "spread_ticks": spread_ticks,
+            "spread_pct": round(spread_pct, 4),
+            "imbalance": round(imbalance, 2),
+            "bid_qty": bid_qty,
+            "ask_qty": ask_qty,
+            "mkt_buy": mkt_buy,
+            "mkt_sell": mkt_sell,
+            "tp_ticks": tp_ticks,
+            "vol_ratio": 0.0,             # 簡略化のため未評価
+            "is_surge": False,            # 簡略化のため未評価
+            "one_sec_value": int(one_sec_value),
+        }
     }
-
-    # 理由メモ
-    if buy_wall:
-        info["reason"].append(f"買い壁 {buy_wall[0]:.1f} に寄せて買いを設定")
-    else:
-        info["reason"].append("買い壁検出なしのためAsk基準で買い設定")
-
-    if sell_wall:
-        info["reason"].append(f"売り壁 {sell_wall[0]:.1f} の1tick手前で利確")
-    else:
-        info["reason"].append(f"壁なしのため最小利確 {params.tp_min_ticks}tick を採用")
-
-    info["reason"].append(f"損切りは {params.sl_ticks}tick（{stop_price:.1f}円）")
-    return info
-
-# ---- サンプル実行（提示いただいたBoardを使用） ----
-if __name__ == "__main__":
-    board = {
-        'AskPrice': 18.0, 'AskQty': 8967700.0, 'AskSign': '0101',
-        'AskTime': '2025-08-13T15:30:00+09:00', 'BidPrice': 19.0, 'BidQty': 7792800.0,
-        'BidSign': '0101', 'BidTime': '2025-08-13T15:30:00+09:00',
-        'Buy1': {'Price': 18.0, 'Qty': 8967700.0, 'Sign': '0101', 'Time': '2025-08-13T15:30:00+09:00'},
-        'Buy2': {'Price': 17.0, 'Qty': 16935400.0}, 'Buy3': {'Price': 16.0, 'Qty': 5800400.0},
-        'Buy4': {'Price': 15.0, 'Qty': 3922300.0}, 'Buy5': {'Price': 14.0, 'Qty': 1390800.0},
-        'Buy6': {'Price': 13.0, 'Qty': 493100.0}, 'Buy7': {'Price': 12.0, 'Qty': 250500.0},
-        'Buy8': {'Price': 11.0, 'Qty': 107300.0}, 'Buy9': {'Price': 10.0, 'Qty': 206500.0},
-        'Buy10': {'Price': 9.0, 'Qty': 33500.0}, 'CalcPrice': 18.0, 'ChangePreviousClose': 0.0,
-        'ChangePreviousClosePer': 0.0, 'CurrentPrice': 18.0, 'CurrentPriceChangeStatus': '0061',
-        'CurrentPriceStatus': 1, 'CurrentPriceTime': '2025-08-13T15:30:00+09:00', 'Exchange': 1,
-        'ExchangeName': '東証プ', 'HighPrice': 19.0, 'HighPriceTime': '2025-08-13T09:00:01+09:00',
-        'LowPrice': 18.0, 'LowPriceTime': '2025-08-13T09:00:00+09:00', 'MarketOrderBuyQty': 0.0,
-        'MarketOrderSellQty': 0.0, 'OpeningPrice': 18.0, 'OpeningPriceTime': '2025-08-13T09:00:00+09:00',
-        'OverSellQty': 7305300.0, 'PreviousClose': 18.0, 'PreviousCloseTime': '2025-08-12T00:00:00+09:00',
-        'SecurityType': 1, 'Sell1': {'Price': 19.0, 'Qty': 7792800.0, 'Sign': '0101', 'Time': '2025-08-13T15:30:00+09:00'},
-        'Sell2': {'Price': 20.0, 'Qty': 10384800.0}, 'Sell3': {'Price': 21.0, 'Qty': 4883900.0},
-        'Sell4': {'Price': 22.0, 'Qty': 2287700.0}, 'Sell5': {'Price': 23.0, 'Qty': 1056000.0},
-        'Sell6': {'Price': 24.0, 'Qty': 1521400.0}, 'Sell7': {'Price': 25.0, 'Qty': 1411900.0},
-        'Sell8': {'Price': 26.0, 'Qty': 1105500.0}, 'Sell9': {'Price': 27.0, 'Qty': 1145200.0},
-        'Sell10': {'Price': 28.0, 'Qty': 655800.0}, 'Symbol': '6740', 'SymbolName': 'ジャパンディスプレイ',
-        'TotalMarketValue': 69846984396.0, 'TradingValue': 2985595200.0, 'TradingVolume': 165863200.0,
-        'TradingVolumeTime': '2025-08-13T15:30:00+09:00', 'UnderBuyQty': 38835900.0, 'VWAP': 18.0003
-    }
-
-    plan = decide_prices(board)
-    print(plan)

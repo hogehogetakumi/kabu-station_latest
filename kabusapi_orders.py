@@ -2,7 +2,7 @@ import urllib.request
 import json
 import pprint
 from kabusapi_token import get_token
-from const import base_url, order_params
+from const import base_url, buy_order_params, sell_order_params, order_params_by_id
 
 def get_orders(params=None):
     if params is None:
@@ -21,7 +21,6 @@ def get_orders(params=None):
             print()
             content = json.loads(res.read())
             pprint.pprint(content)
-            print("Orders retrieved successfully.", content)
             return content
     except urllib.error.HTTPError as e:
         print(e)

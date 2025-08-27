@@ -1,8 +1,10 @@
 import os
 from datetime import datetime
 
-target_symbol = '9973@1'
-target_symbol_no_exchange = '9973'
+target_symbol = '6740@1'
+target_symbol_no_exchange = '6740'
+
+total_limit = 1000000
 
 # # 検証環境
 # api_key = os.environ["VERIFI_API_PASSWORD"]
@@ -16,7 +18,6 @@ api_key = os.environ["PRODUCTION_API_PASSWORD"]
 def get_today_midnight():
     now = datetime.now()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    print(midnight.strftime('%Y%m%d%H%M%S'))
     return midnight.strftime('%Y%m%d%H%M%S')
 
 buy_obj = {
@@ -42,7 +43,7 @@ sell_obj = {
     "Side":           1,        # 売り（1）
     "CashMargin":     1,        # 現物取引
     "DelivType":      0,        # 預り金決済
-    "FundType":       '  ',     # 保護預り（信用代用 "AA" でも可）
+    "FundType":       "  ",     # 保護預り（信用代用 "AA" でも可）
     "AccountType":    4,        # 特定口座（源泉徴収あり）
     "Qty":            100,      # 株数
     "FrontOrderType": 20,       # 成行
@@ -51,6 +52,17 @@ sell_obj = {
 }
 
 today_start = get_today_midnight()
+buy_order_params = {
+    "product": "0",  # Enum値（1: 現物取引）
+    "side": "2",  # Enum値（1: 売、2:
+    "updtime": today_start,  # 本日の午前0時のタイムスタンプ
+}
+sell_order_params = {
+    "product": "0",  # Enum値（1: 現物取引）
+    "side": "1",  # Enum値（1: 売、2:
+    "updtime": today_start,  # 本日の午前0時のタイムスタンプ
+}
+
 order_params = {
     "product": "1",  # Enum値（1: 現物取引）
     "symbol": target_symbol_no_exchange,  # 銘柄コード
@@ -233,3 +245,5 @@ position_params = {
     'side': '1',  # Enum値（1: 売、2: 買）
     'addinfo': 'false'  # true: 追加情報を出力する、false: 出力しない
 }
+
+symbol_list = ["1757", "9973", "6740", "8918", "4564"]
